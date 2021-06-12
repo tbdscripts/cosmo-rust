@@ -198,7 +198,7 @@ namespace Oxide.Plugins
             public static string ExpireAction = @"
                 UPDATE `actions`
                 SET `active` = FALSE
-                WHERE `id` = %s;    
+                WHERE `id` = @0;    
             ";
         }
         
