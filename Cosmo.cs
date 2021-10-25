@@ -1,251 +1,146 @@
-﻿using System.Collections.Generic;
-using Newtonsoft.Json;
-using Oxide.Core.Database;
-using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Libraries;
+using System.Threading.Tasks;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Oxide.Plugins
 {
-    [Info("Cosmo", "Mex de Loo", "0.1.0")]
+    [Info("Cosmo", "Mex de Loo <mex@zeodev.cc>", "1.0.0")]
     public class Cosmo : RustPlugin
     {
-        private PluginConfig _config;
-        private Core.MySql.Libraries.MySql _mySql;
-        private Connection _connection;
-
-        void Init()
+        #region Struct Definitions
+        public struct PluginConfiguration
         {
-            _config = Config.ReadObject<PluginConfig>();
-            _mySql = GetLibrary<Core.MySql.Libraries.MySql>();
+            public string InstanceUrl { get; set; }
+            public string ServerToken { get; set; }
+            public int FetchInterval { get; set; }
 
-            var creds = _config.Database;
-            _connection = _mySql.OpenDb(
-                creds.Host, creds.Port, creds.Database, creds.Username, creds.Password,
-                this
-            );
-
-            timer.Every(_config.CheckTime, () =>
+            public static PluginConfiguration Default => new
             {
-                CheckForPendingOrders();
-                CheckForExpiredActions();
-            });
+                InstanceUrl = "https://your.domain",
+                ServerToken = "your secret server token",
+                FetchInterval = 60
+            };
         }
 
-        private void CheckForPendingOrders()
+        public struct Order
         {
-            DebugPuts("Checking for pending orders");
-            Sql sql = Sql.Builder.Append(SqlQueries.CheckForPendingOrders, _config.ServerId);
+            public ulong Id { get; set; }
+            public string Receiver { get; set; }
+            public string PackageName { get; set; }
 
-            _mySql.Query(sql, _connection, list =>
-            {
-                if (list == null)
-                {
-                    return;
-                }
-
-                foreach (var entry in list)
-                {
-                    HandlePendingOrder(entry);
-                }
-            });
+#nullable enable
+            public List<Action> Actions { get; set; }
+#nullable disable
         }
 
-        private void HandlePendingOrder(Dictionary<string, object> order)
+        public struct Action
         {
-            var receiver = order["receiver"].ToString();
-            if (receiver == null) return;
-            
-            var player = covalence.Players.FindPlayerById(receiver);
-            if (player == null || !player.IsConnected) return;
+            public ulong Id { get; set; }
+            public string Receiver { get; set; }
+            public string Name { get; set; }
+            public object Data { get; set; }
 
-            var sql = Sql.Builder.Append(SqlQueries.GetPendingOrderActions, order["id"].ToString());
-            
-            _mySql.Query(sql, _connection, actions =>
-            {
-                var hasFailed = false;
-
-                foreach (var action in actions)
-                {
-                    var success = HandlePendingAction(player, action);
-                    if (!success) hasFailed = true;
-                }
-
-                if (!hasFailed)
-                {
-                    _mySql.Update(Sql.Builder.Append(SqlQueries.DeliverOrder, order["id"]), _connection);
-                }
-            });
+#nullable enable
+            public Order Order { get; set; }
+#nullable disable
         }
 
-        private bool HandlePendingAction(IPlayer player, Dictionary<string, object> action)
+        public struct PendingStoreResponse
         {
-            if (action["receiver"].ToString() != player.Id) return false;
-            if (action["name"].ToString() != "console_command") return false;
-
-            var data = JsonConvert.DeserializeObject<ConsoleCommandData>(action["data"].ToString());
-            var cmdArr = data.cmd
-                .Replace(":sid64", player.Id)
-                .Replace(":nick", player.Name);
-
-            Server.Command(cmdArr);
-
-            var sql = Sql.Builder.Append(SqlQueries.CompleteAction, action["id"]);
-            _mySql.Update(sql, _connection);
-            
-            return true;
+            [JsonPropertyName("orders")] public List<Order> PendingOrders { get; set; }
+            [JsonPropertyName("actions")] public List<Action> ExpiredActions { get; set; }
         }
 
-        private void CheckForExpiredActions()
+        public struct ConsoleCommandData
         {
-            DebugPuts("Checking for expired actions.");
-            Sql sql = Sql.Builder.Append(SqlQueries.CheckForExpiredActions, _config.ServerId);
-
-            _mySql.Query(sql, _connection, list =>
-            {
-                if (list == null)
-                {
-                    return;
-                }
-
-                foreach (var action in list)
-                {
-                    HandleExpiredAction(action);
-                }
-            });
+            [JsonPropertyName("cmd")] public string Command { get; set; }
+            [JsonPropertyName("expire_cmd")] public string ExpireCommand { get; set; }
         }
-
-        private void HandleExpiredAction(Dictionary<string, object> action)
-        {
-            if (action["name"].ToString() != "console_command") return;
-            
-            var receiver = action["receiver"].ToString();
-            if (receiver == null) return;
-
-            var player = covalence.Players.FindPlayerById(receiver);
-            if (player == null || !player.IsConnected) return;
-
-            var data = JsonConvert.DeserializeObject<ConsoleCommandData>(action["data"].ToString());
-            var cmdArr = data.expire_cmd
-                .Replace(":sid64", player.Id)
-                .Replace(":nick", player.Name);
-
-            Server.Command(cmdArr);
-
-            _mySql.Update(Sql.Builder.Append(SqlQueries.ExpireAction, action["id"]), _connection);
-        }
-        
-        private void DebugPuts(string format, params object[] args)
-        {
-            if (_config.DebugMode)
-            {
-                Puts(format, args);
-            }
-        }
-
-        #region structs
-        
-        private struct ConsoleCommandData
-        {
-            public string cmd, expire_cmd;
-        }
-        
-        #endregion
-        
-        #region sql
-
-        private class SqlQueries
-        {
-            public static string CheckForPendingOrders = @"
-                SELECT o.id, o.receiver, p.name AS `package_name`
-                FROM orders o
-                    INNER JOIN packages p on o.package_id = p.id
-                WHERE status = 'waiting_for_package'
-                    AND @0 IN (SELECT packageable_id
-                                FROM packageables pkg
-                                WHERE packageable_type = 'App\\Models\\Index\\Server'
-                                AND o.package_id = pkg.package_id);
-            ";
-            
-            public static string CheckForExpiredActions = @"
-                SELECT a.id, a.name, a.receiver, a.data
-                FROM `actions` a
-                  INNER JOIN orders o ON a.order_id = o.id
-                WHERE `expires_at` < CURRENT_TIMESTAMP
-                  AND `active` = TRUE
-                  AND @0 IN (SELECT packageable_id
-                              FROM packageables pkg
-                              WHERE packageable_type = 'App\\Models\\Index\\Server'
-                              AND o.package_id = pkg.package_id);
-            ";
-
-            public static string GetPendingOrderActions = @"
-                SELECT `id`, `name`, `data`, `receiver`
-                FROM `actions`
-                WHERE `delivered_at` IS NULL AND `order_id` = @0 AND `active` = FALSE;            
-            ";
-
-            public static string CompleteAction = @"
-                UPDATE `actions`
-                SET `delivered_at` = CURRENT_TIMESTAMP(), `active` = TRUE
-                WHERE `id` = @0;
-            ";
-
-            public static string DeliverOrder = @"
-                UPDATE `orders`
-                SET `status` = 'delivered'
-                WHERE `id` = @0
-            ";
-
-            public static string ExpireAction = @"
-                UPDATE `actions`
-                SET `active` = FALSE
-                WHERE `id` = @0;    
-            ";
-        }
-        
         #endregion
 
-        #region config
-
-        protected override void LoadDefaultConfig()
+        #region Initialization
+        private void Init()
         {
-            Puts("Creating a new configuration file.");
+            LoadConfig();
+            StartStoreTimer();
+        }
+        #endregion
 
-            Config.WriteObject(PluginConfig.GetDefaultConfig(), true);
+        #region Configuration Setup
+        public PluginConfiguration Configuration { get; private set; }
+
+        private void LoadConfig() {
+            Configuration = Config.ReadObject<PluginConfiguration>();
         }
 
-        private class PluginConfig
+        protected override void LoadDefaultConfig() => Config.WriteObject(PluginConfiguration.Default, true);
+
+        private void SaveConfig() => Config.WriteObject(Configuration, true);
+        #endregion
+
+        #region Http Requests
+        private Task<T> MakeApiCall<T>(RequestMethod method, string endpoint, int expectedStatus = 200)
         {
-            public struct DatabaseCredentials
+            return Task.Run(() => 
             {
-                public string Host, Username, Password, Database;
-                public int Port;
-            }
+                var completionSource = new TaskCompletionSource<T>();
+                var url = Configuration.InstanceUrl.TrimRight('/') + "/api/game" + endpoint.TrimLeft('/');
 
-            public bool DebugMode { get; set; }
-            
-            public int ServerId { get; set; }
-            public float CheckTime { get; set; }
-            public DatabaseCredentials Database { get; set; }
-
-            public static PluginConfig GetDefaultConfig()
-            {
-                DatabaseCredentials creds;
-                creds.Host = "localhost";
-                creds.Username = "root";
-                creds.Password = "Password1";
-                creds.Database = "cosmo";
-                creds.Port = 3306;
-
-                return new PluginConfig
+                webrequest.Enqueue(url, null, (code, rawBody) => 
                 {
-                    DebugMode = false,
-                    ServerId = 1,
-                    CheckTime = 20f,
-                    Database = creds
-                };
-            }
+                    if (code != expectedStatus)
+                    {
+                        completionSource.SetException(new System.Exception("Invalid stuf."));
+                        return;
+                    }
+
+                    var body = JsonSerializer.Deserialize<T>(rawBody);
+
+                    completionSource.SetResult(body);
+                }, this, method);
+
+                return completionSource.Task;
+            });
         }
 
+        private Task<PendingStoreResponse> GetPendingStore()
+        {
+            return await MakeApiCall<PendingStoreResponse>(RequestMethod.GET, "store/pending");
+        }
+        #endregion
+
+        #region Handling
+        private void StartStoreTimer() => 
+            timer.Every(Configuration.FetchInterval, async () => await CheckForPending());
+
+        public async Task CheckForPending()
+        {
+            var pending = await GetPendingStore();
+
+            foreach (var order in pending.PendingOrders)
+            {
+                if (order.Actions is null) continue;
+
+                LogWarning("Handling pending order: " + order.Id);
+
+                foreach (var action in order.Actions)
+                {
+                    if (action.Receiver != order.Receiver || action.Name != "console_command") continue;
+
+                    var data = (ConsoleCommandData)action.Data;
+
+                    await CompleteAction(action.Id);
+                }
+
+                await DeliverOrder(order.Id);
+            }
+
+            foreach (var action in pending.ExpiredActions)
+            {
+
+            }
+        }
         #endregion
     }
 }
