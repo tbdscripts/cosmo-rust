@@ -1,5 +1,5 @@
 using Oxide.Core.Libraries;
-using System.Threading.Tasks;
+using Oxide.Core.Libraries.Covalence;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -39,7 +39,7 @@ namespace Oxide.Plugins
             public ulong Id { get; set; }
             public string Receiver { get; set; }
             public string Name { get; set; }
-            public object Data { get; set; }
+            public JsonElement Data { get; set; }
 
 #nullable enable
             public Order Order { get; set; }
@@ -80,66 +80,99 @@ namespace Oxide.Plugins
         #endregion
 
         #region Http Requests
-        private Task<T> MakeApiCall<T>(RequestMethod method, string endpoint, int expectedStatus = 200)
+        private void MakeApiCall<T>(RequestMethod method, string endpoint, int expectedStatus = 200, Action<T> callback)
         {
-            return Task.Run(() => 
+            var url = Configuration.InstanceUrl.TrimRight('/') + "/api/game" + endpoint.TrimLeft('/');
+
+            webrequest.Enqueue(url, null, (code, rawBody) => 
             {
-                var completionSource = new TaskCompletionSource<T>();
-                var url = Configuration.InstanceUrl.TrimRight('/') + "/api/game" + endpoint.TrimLeft('/');
-
-                webrequest.Enqueue(url, null, (code, rawBody) => 
+                if (code != expectedStatus)
                 {
-                    if (code != expectedStatus)
-                    {
-                        completionSource.SetException(new System.Exception("Invalid stuf."));
-                        return;
-                    }
+                    throw new System.Exception("Something went wrong.");
+                    return;
+                }
 
-                    var body = JsonSerializer.Deserialize<T>(rawBody);
+                var body = JsonSerializer.Deserialize<T>(rawBody);
 
-                    completionSource.SetResult(body);
-                }, this, method);
-
-                return completionSource.Task;
-            });
-        }
-
-        private Task<PendingStoreResponse> GetPendingStore()
-        {
-            return await MakeApiCall<PendingStoreResponse>(RequestMethod.GET, "store/pending");
+                callback(body);
+            }, this, method);
         }
         #endregion
 
         #region Handling
-        private void StartStoreTimer() => 
-            timer.Every(Configuration.FetchInterval, async () => await CheckForPending());
+        private void StartStoreTimer() => timer.Every(Configuration.FetchInterval, CheckForPending);
 
-        public async Task CheckForPending()
+        public void CheckForPending()
         {
-            var pending = await GetPendingStore();
-
-            foreach (var order in pending.PendingOrders)
+            MakeApiCall<PendingStoreResponse>(RequestMethod.GET, "store/pending", 200, result =>
             {
-                if (order.Actions is null) continue;
-
-                LogWarning("Handling pending order: " + order.Id);
-
-                foreach (var action in order.Actions)
+                foreach (var order in result.PendingOrders)
                 {
-                    if (action.Receiver != order.Receiver || action.Name != "console_command") continue;
-
-                    var data = (ConsoleCommandData)action.Data;
-
-                    await CompleteAction(action.Id);
+                    HandlePendingOrder(order);
                 }
 
-                await DeliverOrder(order.Id);
-            }
+                foreach (var action in result.ExpiredActions)
+                {
+                    HandleExpiredAction(action);
+                }
+            });
+        }
 
-            foreach (var action in pending.ExpiredActions)
+        private void HandlePendingOrder(Order order)
+        {
+            if (order.Actions is null) return;
+
+            LogWarning("Handling pending order: " + order.Id);
+
+            var player = covalence.Players.FindPlayerById(order.Receiver);
+            if (player is null || !player.IsConnected) return;
+
+            var success = true;
+            foreach (var action in order.Actions)
             {
-
+                var result = HandlePendingAction(action, player, order);
+                if (!result)
+                {
+                    success = false;
+                }
             }
+
+            if (!success) return;
+
+            // deliver order
+        }
+
+        private bool HandlePendingAction(Action action, IPlayer player, Order order)
+        {
+            if (action.Receiver != order.Receiver || action.Name != "console_command") return false;
+
+            var data = JsonSerializer.Deserialize<ConsoleCommandData>(order.Data.GetRawText());
+            var command = data.Command
+                .Replace(":sid64", player.Id)
+                .Replace(":nick", player.Name);
+
+            Server.Command(command);
+
+            // complete action
+
+            return true;
+        }
+
+        private void HandleExpiredAction(Action action)
+        {
+            if (action.Name != "console_command") return;
+
+            var player = covalence.Players.FindPlayerById(action.Receiver);
+            if (player is null || !player.IsConnected) return;
+
+            var data = JsonSerializer.Deserialize<ConsoleCommandData>(action.Data);
+            var command = data.Command
+                .Replace(":sid64", player.Id)
+                .Replace(":nick", player.Name);
+
+            Server.Command(command);
+
+            // expire action
         }
         #endregion
     }
