@@ -1,4 +1,5 @@
 ﻿using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Oxide.Core.Database;
 using Oxide.Core.Libraries.Covalence;
@@ -75,6 +76,11 @@ namespace Oxide.Plugins
                 }
             });
         }
+        
+        private string ReplacePlayerNick(string nick)
+        {
+            return "\"" + Regex.Replace(nick, "[;\"']", "") + "\"";
+        }
 
         private bool HandlePendingAction(IPlayer player, Dictionary<string, object> action)
         {
@@ -84,7 +90,7 @@ namespace Oxide.Plugins
             var data = JsonConvert.DeserializeObject<ConsoleCommandData>(action["data"].ToString());
             var cmdArr = data.cmd
                 .Replace(":sid64", player.Id)
-                .Replace(":nick", player.Name);
+                .Replace(":nick", ReplacePlayerNick(player.Name));
 
             Server.Command(cmdArr);
 
@@ -126,7 +132,7 @@ namespace Oxide.Plugins
             var data = JsonConvert.DeserializeObject<ConsoleCommandData>(action["data"].ToString());
             var cmdArr = data.expire_cmd
                 .Replace(":sid64", player.Id)
-                .Replace(":nick", player.Name);
+                .Replace(":nick", ReplacePlayerNick(player.Name));
 
             Server.Command(cmdArr);
 
